@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from . import metrics
 from .mock_llm import FakeLLM
@@ -11,9 +10,6 @@ from .mock_rag import retrieve
 from .pii import hash_user_id, summarize_text
 from .prompt_management import resolve_prompt
 from .tracing import get_langfuse_client, observe, propagate_attributes, tracing_enabled
-
-if TYPE_CHECKING:
-    from .tracing import LangfuseClient
 
 
 @dataclass
@@ -25,6 +21,18 @@ class AgentResult:
     tokens_out: int
     cost_usd: float
     quality_score: float
+
+
+def _run_retrieval(message: str):
+    """Child observation for retrieval step."""
+    docs = retrieve(message)
+    return docs
+
+
+def _run_llm(prompt_text: str, model: str):
+    """Child observation for LLM generation step."""
+    llm = FakeLLM(model=model)
+    return llm.generate(prompt_text)
 
 
 class LabAgent:
@@ -41,7 +49,7 @@ class LabAgent:
         message: str,
         correlation_id: str,
     ) -> AgentResult:
-        langfuse: "LangfuseClient" = get_langfuse_client()
+        langfuse_client = get_langfuse_client()
         with propagate_attributes(
             user_id=hash_user_id(user_id),
             session_id=session_id,
@@ -57,29 +65,25 @@ class LabAgent:
             started = time.perf_counter()
 
             # Child observation: retrieval
-            with langfuse.start_span(
-                name="retrieval",
-                type="retriever",
+            docs = _run_retrieval(message)
+            langfuse_client.update_current_span(
                 metadata={
+                    "step": "retrieval",
+                    "doc_count": len(docs),
                     "query_preview": summarize_text(message),
                 }
-            ):
-                docs = retrieve(message)
-                langfuse.update_current_span(
-                    metadata={
-                        "doc_count": len(docs),
-                        "query_preview": summarize_text(message),
-                    }
-                )
+            )
 
             prompt = resolve_prompt(
-                langfuse,
+                langfuse_client,
                 feature=feature,
                 docs=docs,
                 message=message,
                 enabled=tracing_enabled(),
             )
-            langfuse.update_current_span(
+
+            # Update root span with prompt metadata
+            langfuse_client.update_current_span(
                 metadata={
                     "doc_count": len(docs),
                     "query_preview": summarize_text(message),
@@ -93,33 +97,24 @@ class LabAgent:
             )
 
             # Child observation: LLM generation
-            with langfuse.start_span(
-                name="generation",
-                type="generation",
+            with propagate_attributes(prompt=prompt.managed_prompt):
+                response = _run_llm(prompt.text, self.model)
+
+            # Update generation metadata
+            cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
+            langfuse_client.update_current_generation(
                 metadata={
                     "model": self.model,
-                    "prompt_name": prompt.name,
-                    "prompt_label": prompt.label,
-                    "prompt_version": prompt.version,
-                }
-            ):
-                with propagate_attributes(prompt=prompt.managed_prompt):
-                    response = self.llm.generate(prompt.text)
-
-                cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
-                langfuse.update_current_generation(
-                    metadata={
-                        "model": self.model,
-                        "prompt_tokens": response.usage.input_tokens,
-                        "completion_tokens": response.usage.output_tokens,
-                        "cost_usd": cost_usd,
-                    },
-                    usage={
-                        "input_tokens": response.usage.input_tokens,
-                        "output_tokens": response.usage.output_tokens,
-                        "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
-                    },
-                )
+                    "prompt_tokens": response.usage.input_tokens,
+                    "completion_tokens": response.usage.output_tokens,
+                    "cost_usd": cost_usd,
+                },
+                usage={
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+                },
+            )
 
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
